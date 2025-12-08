@@ -55,6 +55,11 @@ unsigned long pwmRampStartCh[4]; // one for each channel
 unsigned long motorStopCh[4];
 uint8_t activeMask = 0;
 unsigned long motionStart = 0;
+
+// ===================== WINK =====================
+int winkStep = 0; // 0 = none, 1 = first movement, 2 = return
+bool winkLeftNext = true;  // alternates which head winks
+uint8_t winkSide = 0;     // 0 = left, 1 = right (active wink side)
 bool winkOriginalUp = false;
 
 // ===================== WAVE =====================
@@ -65,7 +70,6 @@ const int waveSequence[] = {
   leftupPin, rightupPin,
   leftdownPin, rightdownPin
 };
-int winkStep = 0; 
 const int WAVE_STEPS = sizeof(waveSequence) / sizeof(waveSequence[0]);
 int waveStep = 0;
 unsigned long waveStepStart = 0;
@@ -250,13 +254,25 @@ void startWink() {
   motionStart = millis();
   winkStep = 1;
 
-  // store original state ONCE
-  winkOriginalUp = headUp[0];
+  // choose which side to wink
+  winkSide = winkLeftNext ? 0 : 1;
+  winkLeftNext = !winkLeftNext;  // alternate next time
 
-  // move in opposite direction
-  if (winkOriginalUp) pwmBegin(leftdownPin);
-  else                pwmBegin(leftupPin);
+  // snapshot original position
+  winkOriginalUp = headUp[winkSide];
+
+  // choose correct pin based on side + direction
+  if (winkSide == 0) {
+    // LEFT
+    if (winkOriginalUp) pwmBegin(leftdownPin);
+    else                pwmBegin(leftupPin);
+  } else {
+    // RIGHT
+    if (winkOriginalUp) pwmBegin(rightdownPin);
+    else                pwmBegin(rightupPin);
+  }
 }
+
 
 void startSplit() {
   motionState = ACTIVE;
@@ -323,26 +339,31 @@ void updateMotion() {
     return; 
   }
 
-  // WINK: when the first motor finishes (activeMask cleared for that channel),
-  // we start the second (return) movement, then finish.
   if (motionState == WINKING) {
-    bool leftActive = (activeMask & (MASK(CH_LEFT_UP) | MASK(CH_LEFT_DOWN)));
+    uint8_t upCh   = (winkSide == 0) ? CH_LEFT_UP   : CH_RIGHT_UP;
+    uint8_t downCh = (winkSide == 0) ? CH_LEFT_DOWN : CH_RIGHT_DOWN;
 
-    if (!leftActive) {
+    bool sideActive = activeMask & (MASK(upCh) | MASK(downCh));
+
+    if (!sideActive) {
       if (winkStep == 1) {
-      // return to original position
-        if (winkOriginalUp) pwmBegin(leftupPin);
-        else                pwmBegin(leftdownPin);
+        // return to original position
+        if (winkSide == 0) {
+          if (winkOriginalUp) pwmBegin(leftupPin);
+          else                pwmBegin(leftdownPin);
+        } else {
+          if (winkOriginalUp) pwmBegin(rightupPin);
+          else                pwmBegin(rightdownPin);
+        }
         winkStep = 2;
       } else {
-        // wink finished
         motionState = IDLE;
         winkStep = 0;
       }
     }
-    // done
     return;
   }
+
 
   if (motionState == WAVING) {
     // start next wave step when WAVE_STEP_DELAY elapsed since last step started
