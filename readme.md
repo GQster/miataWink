@@ -218,3 +218,9 @@ MIT License
 
 Use at your own risk.
 
+## References
+I originally got the idea from [curly686's Instructable](https://www.instructables.com/Popup-headlight-wink-with-arduino-and-relay-board-/) then swapped relays for MOSFETs, arduino for esp32 (thinking of making a wifi phone app down the line maybe), added a 5V powersource, and completely redid the code. 
+
+Great starting point though!
+
+---
