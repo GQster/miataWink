@@ -2,22 +2,25 @@
 // ESP32 DevKit V1
 // Non-blocking + soft-start PWM via MOSFETs
 
+#include <Arduino.h>
+
+// ===================== PINS =====================
 #define buttonPin 33
+
 #define leftupPin 25
-#define rightupPin 26
-#define leftdownPin 27
+#define leftdownPin 26
+
+#define rightupPin 27
 #define rightdownPin 14
 
-// ==========================================
-// PWM CONFIG
+// ===================== PWM =====================
 #define PWM_FREQ       1500      // Hz (safe for motors, quiet)
 #define PWM_RESOLUTION 8         // 8-bit (0–255)
 #define PWM_MAX        255
 #define PWM_RAMP_TIME  150       // ms soft-start ramp
-#define MOTOR_TIME     750
+#define MOTOR_TIME     750      // ms motor activation time for up/down         // TODO: adjust timing as needed
 #define MAX_MOTOR_TIME 900
 
-// PWM channels
 #define CH_LEFT_UP     0
 #define CH_RIGHT_UP    1
 #define CH_LEFT_DOWN   2
@@ -26,172 +29,175 @@
 // Bitmask helpers
 #define MASK(ch) (1 << (ch))
 
-// ==========================================
-bool ledVal = false;
 
-enum MotionState { IDLE, STEP1, STEP2 };
-enum MotionType  { NONE, WINK, BOTH_TOGGLE, SPLIT, RESET };
+// ===================== BUTTON =====================
+#define DEBOUNCE_MS    30
+#define CLICK_TIMEOUT  500
+#define LONG_HOLD_TIME 2000
+
+// ===================== STATE =====================
+bool ledVal = false; // false = down, true = up
+
+enum MotionState {
+  IDLE, STEP1, STEP2,
+  WAVE1, WAVE2, WAVE3, WAVE4
+};
+
+enum MotionType {
+  NONE, BOTH_TOGGLE, WINK, WAVE, SPLIT, RESET
+};
 
 MotionState motionState = IDLE;
 MotionType motionType = NONE;
 
 unsigned long motionStart = 0;
 unsigned long pwmRampStart = 0;
-
-// Active PWM channels
 uint8_t activeMask = 0;
 
-// ==========================================
-// Button timing
-int debounce = 50;
-int DCgap = 250;
-int holdTime = 500;
-int longHoldTime = 1500;
+// ===================== BUTTON STATE =====================
+bool rawState = HIGH;
+bool lastRawState = HIGH;
+bool debouncedState = HIGH;
+bool lastDebouncedState = HIGH;
 
-// Button state
-bool buttonVal = HIGH;
-bool buttonLast = HIGH;
-bool DCwaiting = false;
-bool DConUp = false;
-bool singleOK = true;
-
+unsigned long lastBounceTime = 0;
 unsigned long downTime = 0;
-unsigned long upTime = 0;
+unsigned long lastReleaseTime = 0;
 
-bool ignoreUp = false;
-bool waitForUp = false;
-bool holdEventPast = false;
-bool longHoldEventPast = false;
+int clickCount = 0;
+bool waitingForMoreClicks = false;
+bool longHoldFired = false;
 
-// ==========================================
-// Utility: PWM helpers
+// ===================== PWM HELPERS =====================
+const int motorPins[] = {
+  leftupPin, rightupPin, leftdownPin, rightdownPin
+};
+
+const int motorChannels[] = {
+  CH_LEFT_UP, CH_RIGHT_UP, CH_LEFT_DOWN, CH_RIGHT_DOWN
+};
 
 void pwmOffAll() {
-  ledcWrite(CH_LEFT_UP, 0);
-  ledcWrite(CH_RIGHT_UP, 0);
-  ledcWrite(CH_LEFT_DOWN, 0);
-  ledcWrite(CH_RIGHT_DOWN, 0);
+  for (int i = 0; i < 4; i++) ledcWrite(motorPins[i], 0);
   activeMask = 0;
 }
 
-void pwmBegin(unsigned ch) {
-  ledcWrite(ch, 0);   // barely on
+void pwmBegin(int pin) {
+  // start ramp for the specified pin
+  ledcWrite(pin, 0);   // ensure starts low
+  int ch = 0;
+  if (pin == leftupPin) ch = CH_LEFT_UP;
+  else if (pin == rightupPin) ch = CH_RIGHT_UP;
+  else if (pin == leftdownPin) ch = CH_LEFT_DOWN;
+  else if (pin == rightdownPin) ch = CH_RIGHT_DOWN;
   activeMask |= MASK(ch);
   pwmRampStart = millis();
 }
 
-void pwmUpdate(unsigned ch) {
-  if (!(activeMask & MASK(ch))) return;
+void pwmUpdate() {
+  unsigned long dt = millis() - pwmRampStart;
+  uint8_t duty = (dt >= PWM_RAMP_TIME)
+                   ? PWM_MAX
+                   : map(dt, 0, PWM_RAMP_TIME, 0, PWM_MAX);
 
-  unsigned long elapsed = millis() - pwmRampStart;
-  if (elapsed >= PWM_RAMP_TIME) {
-    ledcWrite(ch, PWM_MAX);
-  } else {
-    uint8_t duty = map(elapsed, 0, PWM_RAMP_TIME, 0, PWM_MAX);
-    ledcWrite(ch, duty);
+  for (int i = 0; i < 4; i++) {
+    if (activeMask & MASK(motorChannels[i])) {
+      ledcWrite(motorPins[i], duty);
+    }
   }
 }
 
-void pwmUpdateActive() {
-  for (uint8_t ch = 0; ch < 4; ch++) {
-    pwmUpdate(ch);
-  }
-}
-
-// ==========================================
+// ===================== SETUP =====================
 void setup() {
   pinMode(buttonPin, INPUT_PULLUP);
 
-  ledcSetup(CH_LEFT_UP,   PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(CH_RIGHT_UP,  PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(CH_LEFT_DOWN, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(CH_RIGHT_DOWN,PWM_FREQ, PWM_RESOLUTION);
-
-  ledcAttachPin(leftupPin,   CH_LEFT_UP);
-  ledcAttachPin(rightupPin,  CH_RIGHT_UP);
-  ledcAttachPin(leftdownPin, CH_LEFT_DOWN);
-  ledcAttachPin(rightdownPin,CH_RIGHT_DOWN);
+  ledcAttachChannel(leftupPin,   PWM_FREQ, PWM_RESOLUTION, CH_LEFT_UP);
+  ledcAttachChannel(rightupPin,  PWM_FREQ, PWM_RESOLUTION, CH_RIGHT_UP);
+  ledcAttachChannel(leftdownPin, PWM_FREQ, PWM_RESOLUTION, CH_LEFT_DOWN);
+  ledcAttachChannel(rightdownPin,PWM_FREQ, PWM_RESOLUTION, CH_RIGHT_DOWN);
 
   pwmOffAll();
+  // Optional: enable Serial for debugging
+  // Serial.begin(115200);
+
+  // Reset on startup
+  startReset();
 }
 
-// ==========================================
+// ===================== LOOP =====================
 void loop() {
-  int b = checkButton();
+  int evt = checkButton();
 
-  if (b == 4) {
-    startResetEvent();
-  }
+  // long-hold (reset) handled as immediate event code 5
+  if (evt == 5) startReset();
   else if (motionState == IDLE) {
-    if (b == 1) startWinkEvent();
-    if (b == 2) startBothToggleEvent();
-    if (b == 3) startSplitEvent();
+    if (evt == 1) startBothToggle();   // single click -> OEM toggle both
+    if (evt == 2) startWink();         // double -> wink
+    if (evt == 3) startWave();         // triple -> wave
+    if (evt == 4) startSplit();        // quadruple -> split
   }
 
-  if (motionState != IDLE) {
-    updateMotion();
-  }
+  if (motionState != IDLE) updateMotion();
 }
 
-// ==========================================
-// Motion starters
-
-void startWinkEvent() {
-  motionType = WINK;
-  motionState = STEP1;
-  motionStart = millis();
-  pwmRampStart = millis();
-
-  if (!ledVal) pwmBegin(CH_LEFT_UP);
-  else         pwmBegin(CH_LEFT_DOWN);
-}
-
-void startBothToggleEvent() {
+// ===================== MOTIONS =====================
+void startBothToggle() {
   ledVal = !ledVal;
-
   motionType = BOTH_TOGGLE;
   motionState = STEP1;
   motionStart = millis();
-  pwmRampStart = millis();
-
   if (ledVal) {
-    pwmBegin(CH_LEFT_UP);
-    pwmBegin(CH_RIGHT_UP);
+    pwmBegin(leftupPin); 
+    pwmBegin(rightupPin);
   } else {
-    pwmBegin(CH_LEFT_DOWN);
-    pwmBegin(CH_RIGHT_DOWN);
+    pwmBegin(leftdownPin);
+    pwmBegin(rightdownPin);
   }
 }
 
-void startSplitEvent() {
-  ledVal = !ledVal;
+void startWink() {
+  motionType = WINK;
+  motionState = STEP1;
+  motionStart = millis();
+  if (!ledVal) pwmBegin(leftupPin);
+  else pwmBegin(leftdownPin);
+}
 
+void startSplit() {
   motionType = SPLIT;
   motionState = STEP1;
   motionStart = millis();
-  pwmRampStart = millis();
 
-  pwmBegin(CH_LEFT_UP);
-  pwmBegin(CH_RIGHT_DOWN);
+  if (!ledVal) {
+    pwmBegin(leftupPin);
+    pwmBegin(rightdownPin);
+  } else {
+    pwmBegin(leftdownPin);
+    pwmBegin(rightupPin);
+  }
+  ledVal = !ledVal;
 }
 
-void startResetEvent() {
+void startWave() {
+  motionType = WAVE;
+  motionState = WAVE1;
+  motionStart = millis();
+  pwmOffAll();
+}
+
+void startReset() {
   motionType = RESET;
   motionState = STEP1;
   motionStart = millis();
-  pwmRampStart = millis();
-
   ledVal = false;
-
-  pwmBegin(CH_LEFT_DOWN);
-  pwmBegin(CH_RIGHT_DOWN);
+  pwmBegin(leftdownPin);
+  pwmBegin(rightdownPin);
 }
 
-// ==========================================
-// Motion update
-
+// ===================== MOTION UPDATE =====================
 void updateMotion() {
   unsigned long now = millis();
+  pwmUpdate();
 
   if (now - motionStart > MAX_MOTOR_TIME) {
     pwmOffAll();
@@ -200,84 +206,112 @@ void updateMotion() {
     return;
   }
 
-  pwmUpdateActive();
+  switch (motionType) {
+    case WINK:
+      if (motionState == STEP1 && now - motionStart >= MOTOR_TIME) {
+        pwmOffAll();
+        motionState = STEP2;
+        motionStart = now;
+        if (!ledVal) pwmBegin(leftdownPin);
+        else pwmBegin(leftupPin);
+      } else if (motionState == STEP2 && now - motionStart >= MOTOR_TIME) {
+        pwmOffAll();
+        motionState = IDLE;
+        motionType = NONE;
+      }
+      break;
 
-  if (motionState == STEP1 && now - motionStart >= MOTOR_TIME) {
-    pwmOffAll();
-    motionState = (motionType == WINK) ? STEP2 : IDLE;
-    motionStart = now;
+    case BOTH_TOGGLE:
+    case SPLIT:
+    case RESET:
+      if (now - motionStart >= MOTOR_TIME) {
+        pwmOffAll();
+        motionState = IDLE;
+        motionType = NONE;
+      }
+      break;
 
-    if (motionState == STEP2) {
-      pwmRampStart = millis();
-      if (!ledVal) pwmBegin(CH_LEFT_DOWN);
-      else         pwmBegin(CH_LEFT_UP);
-    } else {
-      motionType = NONE;
-    }
-  }
-  else if (motionState == STEP2 && now - motionStart >= MOTOR_TIME) {
-    pwmOffAll();
-    motionState = IDLE;
-    motionType = NONE;
+    case WAVE:
+      if (motionState == WAVE1 && now - motionStart > MOTOR_TIME/2) {
+        pwmBegin(leftupPin); 
+        motionState = WAVE2;
+      } else if (motionState == WAVE2 && now - motionStart > MOTOR_TIME) {
+        pwmBegin(rightupPin); 
+        motionState = WAVE3;
+      } else if (motionState == WAVE3 && now - motionStart > MOTOR_TIME*1.5) {
+        pwmBegin(leftdownPin); 
+        motionState = WAVE4;
+      } else if (motionState == WAVE4 && now - motionStart > MOTOR_TIME*2) {
+        pwmBegin(rightdownPin);
+        motionState = IDLE;
+        motionType = NONE;
+      }
+      break;
+
+    default:
+      break;
   }
 }
 
-// ==========================================
-// Button logic (unchanged)
+// ===================== BUTTON HANDLER =====================
+// Returns:
+// 0 = nothing
+// 1 = single click (toggle both)
+// 2 = double click (wink)
+// 3 = triple click (wave)
+// 4 = quadruple click (split)
+// 5 = long hold (reset)
 
 int checkButton() {
-  int event = 0;
-  buttonVal = digitalRead(buttonPin);
+  rawState = digitalRead(buttonPin);
 
-  if (buttonVal == LOW && buttonLast == HIGH && (millis() - upTime) > debounce) {
+  if (rawState != lastRawState) lastBounceTime = millis();
+
+  if ((millis() - lastBounceTime) > DEBOUNCE_MS) {
+    if (rawState != debouncedState) {
+      debouncedState = rawState;
+
+      // PRESS
+      if (debouncedState == LOW) {
     downTime = millis();
-    ignoreUp = false;
-    waitForUp = false;
-    singleOK = true;
-    holdEventPast = false;
-    longHoldEventPast = false;
+        longHoldFired = false;
+      }
 
-    if ((millis() - upTime) < DCgap && !DConUp && DCwaiting)
-      DConUp = true;
-    else
-      DConUp = false;
-
-    DCwaiting = false;
-  }
-  else if (buttonVal == HIGH && buttonLast == LOW && (millis() - downTime) > debounce) {
-    if (!ignoreUp) {
-      upTime = millis();
-      if (!DConUp) {
-        DCwaiting = true;
-      } else {
-        event = 2;
-        DConUp = false;
-        DCwaiting = false;
-        singleOK = false;
+      // RELEASE
+      if (debouncedState == HIGH) {
+        if (!longHoldFired) {
+      clickCount++;
+          lastReleaseTime = millis();
+          waitingForMoreClicks = true;
+        }
       }
     }
   }
 
-  if (buttonVal == HIGH && DCwaiting && !DConUp && singleOK && (millis() - upTime) >= DCgap) {
-    event = 1;
-    DCwaiting = false;
-  }
-
-  if (buttonVal == LOW && (millis() - downTime) >= holdTime) {
-    if (!holdEventPast) {
-      event = 3;
-      ignoreUp = true;
-      DCwaiting = false;
-      downTime = millis();
-      holdEventPast = true;
-    }
-
-    if ((millis() - downTime) >= longHoldTime && !longHoldEventPast) {
-      event = 4;
-      longHoldEventPast = true;
+  // LONG HOLD
+  if (debouncedState == LOW && !longHoldFired) {
+    if (millis() - downTime >= LONG_HOLD_TIME) {
+      longHoldFired = true;
+      clickCount = 0;
+      waitingForMoreClicks = false;
+      lastRawState = rawState;
+      return 5; // RESET
     }
   }
 
-  buttonLast = buttonVal;
-  return event;
+  // multi-click timeout: decide which click event it was
+  if (waitingForMoreClicks && (millis() - lastReleaseTime) > CLICK_TIMEOUT) {
+    // clamp clicks to 4 for our mapping
+    int c = clickCount;
+    clickCount = 0;
+    waitingForMoreClicks = false;
+    lastRawState = rawState;
+    if (c == 1) return 1;
+    if (c == 2) return 2;
+    if (c == 3) return 3;
+    if (c >= 4) return 4;
+  }
+
+  lastRawState = rawState;
+  return 0;
 }
