@@ -58,15 +58,13 @@ unsigned long motionStart = 0;
 
 // ===================== WINK =====================
 int winkStep = 0; // 0 = none, 1 = first movement, 2 = return
-bool winkLeftNext = true;  // alternates which head winks
+bool winkLeftNext = true;  // alternates which head winks (left first)
 uint8_t winkSide = 0;     // 0 = left, 1 = right (active wink side)
 bool winkOriginalUp = false;
 
 // ===================== WAVE =====================
-// sequence: left up, right up, left down, right down, repeated once
+// sequence: left up, right up, left down, right down, repeated
 const int waveSequence[] = {
-  leftupPin, rightupPin,
-  leftdownPin, rightdownPin,
   leftupPin, rightupPin,
   leftdownPin, rightdownPin
 };
@@ -127,14 +125,13 @@ void pwmOffAll() {
 void pwmBegin(int pin) {
   int ch = pinToChannel(pin);
   if (ch < 0) return;
-  // If already active, restart the scheduled stop to extend duration
-  // (we keep existing ramp start if already active so it doesn't retrigger ramp abruptly)
+  // If already active, keep existing ramp start but extend stop time.
   if (!(activeMask & MASK(ch))) {
     pwmRampStartCh[ch] = millis();
   }
   motorStopCh[ch] = millis() + MOTOR_TIME;
   activeMask |= MASK(ch);
-  // we don't write output immediately; pwmUpdate will ramp
+  // pwmUpdate will ramp the output
 }
 
 void pwmUpdate() {
@@ -180,7 +177,7 @@ void setup() {
   // ensure both down at startup
   headUp[0] = false;
   headUp[1] = false;
-  startReset();
+  startReset(); // bring both down if needed
 }
 
 // ===================== BUTTON HANDLER =====================
@@ -254,25 +251,22 @@ void startWink() {
   motionStart = millis();
   winkStep = 1;
 
-  // choose which side to wink
+  // choose which side to wink and alternate next time
   winkSide = winkLeftNext ? 0 : 1;
-  winkLeftNext = !winkLeftNext;  // alternate next time
+  winkLeftNext = !winkLeftNext;
 
   // snapshot original position
   winkOriginalUp = headUp[winkSide];
 
-  // choose correct pin based on side + direction
+  // start first movement (opposite of original)
   if (winkSide == 0) {
-    // LEFT
     if (winkOriginalUp) pwmBegin(leftdownPin);
     else                pwmBegin(leftupPin);
   } else {
-    // RIGHT
     if (winkOriginalUp) pwmBegin(rightdownPin);
     else                pwmBegin(rightupPin);
   }
 }
-
 
 void startSplit() {
   motionState = ACTIVE;
@@ -296,7 +290,7 @@ void startReset() {
   motionStart = millis();
   if (headUp[0]) pwmBegin(leftdownPin);
   if (headUp[1]) pwmBegin(rightdownPin);
-  // if they are already down, nothing starts and activeMask==0 will cause no-op
+  // if already down, nothing starts and activeMask==0 will cause immediate IDLE
 }
 
 void queueWaveOrStart() {
@@ -316,11 +310,17 @@ void queueWaveOrStart() {
 }
 
 void startWave() {
-  // fallback to startWave if you want immediate start (not used now)
   motionState = WAVING;
   waveStep = 0;
   waveStepStart = millis();
   pwmBegin(waveSequence[waveStep++]);
+}
+
+// Stop wave immediately (called on button press while WAVING)
+void stopWaveNow() {
+  pwmOffAll();
+  motionState = IDLE;
+  startReset();
 }
 
 // ===================== MOTION UPDATE =====================
@@ -343,7 +343,7 @@ void updateMotion() {
     uint8_t upCh   = (winkSide == 0) ? CH_LEFT_UP   : CH_RIGHT_UP;
     uint8_t downCh = (winkSide == 0) ? CH_LEFT_DOWN : CH_RIGHT_DOWN;
 
-    bool sideActive = activeMask & (MASK(upCh) | MASK(downCh));
+    bool sideActive = (activeMask & (MASK(upCh) | MASK(downCh))) != 0;
 
     if (!sideActive) {
       if (winkStep == 1) {
@@ -357,6 +357,7 @@ void updateMotion() {
         }
         winkStep = 2;
       } else {
+        // wink finished
         motionState = IDLE;
         winkStep = 0;
       }
@@ -364,15 +365,12 @@ void updateMotion() {
     return;
   }
 
-
   if (motionState == WAVING) {
     // start next wave step when WAVE_STEP_DELAY elapsed since last step started
     if ((now - waveStepStart) >= WAVE_STEP_DELAY) {
-      // If waveStep reached end, finish
+      // If waveStep reached end, wrap to continue indefinitely
       if (waveStep >= WAVE_STEPS) {
-        // ensure remaining motors finish naturally
-        motionState = IDLE;
-        return;
+        waveStep = 0;
       }
       // start next step without killing previous (per-channel stop logic handles each)
       pwmBegin(waveSequence[waveStep++]);
@@ -397,15 +395,16 @@ void updateMotion() {
   }
 }
 
-// ===================== MAIN LOOP WRAPPER =====================
-void loopWrapper() {
-  // kept for readability if you want to call updateMotion and PWM independently
-  // (we call them in loop())
-}
-
 // ===================== MAIN LOOP =====================
 void loop() {
   int evt = checkButton();
+
+  // If button pressed while WAVING, stop the wave (any event)
+  if (motionState == WAVING && evt != 0) {
+    stopWaveNow();
+    // consume event so it doesn't trigger other actions immediately; return early
+    return;
+  }
 
   // long hold event returned immediately by checkButton
   if (evt == 5) {
