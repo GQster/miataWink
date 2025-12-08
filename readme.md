@@ -135,7 +135,8 @@ Mount directly across the motor terminals.
 - ESP32 powered from regulated 5 V (should be able to take in +30V)
 
 Example:
-- LM2596-style buck module
+- LM2596-style buck module - [Amazon link](https://www.amazon.com/dp/B0DKTMGBHL?ref=ppx_yo2ov_dt_b_fed_asin_title)
+
 
 ---
 
@@ -144,7 +145,7 @@ Example:
 Protects against load dumps and inductive spikes.
 Pair this with your buck converter to make sure it shunts ***below*** its max Vin
 
-- Example: `1.5KE20CA`
+- Example: `1.5KE20CA` - [Aliexpress link](https://www.aliexpress.us/item/3256809377461245.html)
 - Placed across the buck converter **input (12 V side)**
 
 ---
@@ -180,6 +181,15 @@ Pair this with your buck converter to make sure it shunts ***below*** its max Vi
 Repeat **four times**, once per motor direction.
 
 ---
+## Timing / PWM Notes
+
+- PWM frequency: 1.5 kHz
+- PWM resolution: 8-bit (0–255)
+- Soft-start ramp: 150 ms from 0 → 100%
+- Motor activation time (up/down): 750 ms
+- Max motor time (safety cutoff): 900 ms
+- Wave step delay: 75% of motor activation time (~560 ms)
+
 
 ## ⚠️ Automotive notes
 
