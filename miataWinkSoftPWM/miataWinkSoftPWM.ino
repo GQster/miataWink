@@ -17,8 +17,9 @@
 #define PWM_RESOLUTION 8        // 8-bit (0–255)
 #define PWM_MAX        255
 #define PWM_RAMP_TIME  150      // ms soft-start ramp
-#define MOTOR_TIME     750      // ms motor activation time for up/down         // TODO: adjust timing as needed
-#define MAX_MOTOR_TIME 900    // ms maximum motor time as safety cutoff
+#define MOTOR_TIME     750      // ms motor activation time for up/down
+#define MAX_MOTOR_TIME 900      // ms maximum motor time as safety cutoff
+#define WAVE_STEP_DELAY  (MOTOR_TIME*0.75) // Time between wave steps (overlap timing)
 
 #define CH_LEFT_UP     0
 #define CH_RIGHT_UP    1
@@ -28,15 +29,15 @@
 // Bitmask helpers
 #define MASK(ch) (1 << (ch))
 
-
 // ===================== BUTTON =====================
 #define DEBOUNCE_MS    30
 #define CLICK_TIMEOUT  500
 #define LONG_HOLD_TIME 2000
 
 // ===================== STATE =====================
-enum HeadlightPos { DOWN, UP };
-HeadlightPos headlightPos = DOWN;
+// track each headlight physical position independently
+// headUp[0] = left (true = up), headUp[1] = right
+bool headUp[2] = { false, false };
 
 bool splitFlipped = false;
 
@@ -44,16 +45,20 @@ enum MotionState {
   IDLE,
   ACTIVE,
   WINKING,
-  WAVING
-};
+  WAVING,
+  QUEUED_WAVE 
+  };
 
 MotionState motionState = IDLE;
 
-unsigned long motionStart = 0;
-unsigned long pwmRampStart = 0;
+unsigned long pwmRampStartCh[4]; // one for each channel
+unsigned long motorStopCh[4];
 uint8_t activeMask = 0;
+unsigned long motionStart = 0;
+bool winkOriginalUp = false;
 
 // ===================== WAVE =====================
+// sequence: left up, right up, left down, right down, repeated once
 const int waveSequence[] = {
   leftupPin, rightupPin,
   leftdownPin, rightdownPin,
@@ -69,81 +74,157 @@ unsigned long waveStepStart = 0;
 bool stableState = HIGH;
 bool lastReading = HIGH;
 unsigned long lastDebounceTime = 0;
-
 unsigned long pressTime = 0;
 unsigned long lastReleaseTime = 0;
-
 int clickCount = 0;
 bool waitingForClicks = false;
 bool longHoldFired = false;
 
 // ===================== PWM HELPERS =====================
+int pinToChannel(int pin) {
+  if (pin == leftupPin) return CH_LEFT_UP;
+  if (pin == rightupPin) return CH_RIGHT_UP;
+  if (pin == leftdownPin) return CH_LEFT_DOWN;
+  return CH_RIGHT_DOWN;
+}
+
+int channelToPin(int ch) {
+  switch (ch) {
+    case CH_LEFT_UP: return leftupPin;
+    case CH_RIGHT_UP: return rightupPin;
+    case CH_LEFT_DOWN: return leftdownPin;
+    case CH_RIGHT_DOWN: return rightdownPin;
+    default: return -1;
+}
+}
+
+void setHeadStateFromChannelFinish(int ch) {
+  // update headUp[] when a channel finishes
+  switch (ch) {
+    case CH_LEFT_UP:  headUp[0] = true;  break;
+    case CH_LEFT_DOWN: headUp[0] = false; break;
+    case CH_RIGHT_UP: headUp[1] = true;  break;
+    case CH_RIGHT_DOWN: headUp[1] = false; break;
+  }
+}
+
+// ===================== PWM (per-channel) =====================
 void pwmOffAll() {
   ledcWrite(leftupPin, 0);
   ledcWrite(rightupPin, 0);
   ledcWrite(leftdownPin, 0);
   ledcWrite(rightdownPin, 0);
   activeMask = 0;
+  // clear scheduled stops (not required but safer)
+  for (int i=0;i<4;i++) motorStopCh[i]=0;
+  for (int i=0;i<4;i++) pwmRampStartCh[i]=0;
 }
 
 void pwmBegin(int pin) {
-  int ch =
-    (pin == leftupPin)    ? CH_LEFT_UP :
-    (pin == rightupPin)   ? CH_RIGHT_UP :
-    (pin == leftdownPin)  ? CH_LEFT_DOWN :
-                            CH_RIGHT_DOWN;
-
+  int ch = pinToChannel(pin);
+  if (ch < 0) return;
+  // If already active, restart the scheduled stop to extend duration
+  // (we keep existing ramp start if already active so it doesn't retrigger ramp abruptly)
+  if (!(activeMask & MASK(ch))) {
+    pwmRampStartCh[ch] = millis();
+  }
+  motorStopCh[ch] = millis() + MOTOR_TIME;
   activeMask |= MASK(ch);
-  pwmRampStart = millis();
+  // we don't write output immediately; pwmUpdate will ramp
 }
 
 void pwmUpdate() {
-  unsigned long dt = millis() - pwmRampStart;
-  uint8_t duty = (dt >= PWM_RAMP_TIME)
-    ? PWM_MAX
-    : map(dt, 0, PWM_RAMP_TIME, 0, PWM_MAX);
+  unsigned long now = millis();
+  for (int ch = 0; ch < 4; ch++) {
+    if (!(activeMask & MASK(ch))) continue;
 
-  if (activeMask & MASK(CH_LEFT_UP))    ledcWrite(leftupPin, duty);
-  if (activeMask & MASK(CH_RIGHT_UP))   ledcWrite(rightupPin, duty);
-  if (activeMask & MASK(CH_LEFT_DOWN))  ledcWrite(leftdownPin, duty);
-  if (activeMask & MASK(CH_RIGHT_DOWN)) ledcWrite(rightdownPin, duty);
-}
+    // finished?
+    if (now >= motorStopCh[ch]) {
+      // stop channel and update head state
+      activeMask &= ~MASK(ch);
+      int pin = channelToPin(ch);
+      if (pin >= 0) ledcWrite(pin, 0);
+      setHeadStateFromChannelFinish(ch);
+      continue;
+    }
+
+    // ramp duty
+    unsigned long dt = now - pwmRampStartCh[ch];
+    uint8_t duty = (dt >= PWM_RAMP_TIME) ? PWM_MAX : map(dt, 0, PWM_RAMP_TIME, 0, PWM_MAX);
+    switch (ch) {
+      case CH_LEFT_UP:    ledcWrite(leftupPin, duty); break;
+      case CH_RIGHT_UP:   ledcWrite(rightupPin, duty); break;
+      case CH_LEFT_DOWN:  ledcWrite(leftdownPin, duty); break;
+      case CH_RIGHT_DOWN: ledcWrite(rightdownPin, duty); break;
+    }
+    }
+  }
 
 // ===================== SETUP =====================
 void setup() {
   pinMode(buttonPin, INPUT_PULLUP);
 
+  // attach channels (new core API expects pin, freq, res, channel)
   ledcAttachChannel(leftupPin,   PWM_FREQ, PWM_RESOLUTION, CH_LEFT_UP);
   ledcAttachChannel(rightupPin,  PWM_FREQ, PWM_RESOLUTION, CH_RIGHT_UP);
   ledcAttachChannel(leftdownPin, PWM_FREQ, PWM_RESOLUTION, CH_LEFT_DOWN);
   ledcAttachChannel(rightdownPin,PWM_FREQ, PWM_RESOLUTION, CH_RIGHT_DOWN);
 
   pwmOffAll();
-  // Optional: enable Serial for debugging
-  // Serial.begin(115200);
+  // Serial.begin(115200); // enable if you want logs
 
-  // Reset on startup
+  // ensure both down at startup
+  headUp[0] = false;
+  headUp[1] = false;
   startReset();
 }
 
-// ===================== LOOP =====================
-void loop() {
-  int evt = checkButton();
+// ===================== BUTTON HANDLER =====================
+// Returns event codes:
+// 0 = none, 1 = single, 2 = double, 3 = triple, 4 = quad, 5 = long hold (reset)
+int checkButton() {
+  bool reading = digitalRead(buttonPin);
 
-  if (evt == 5) {
-    startReset();
-    return;
+  if (reading != lastReading) lastDebounceTime = millis();
+
+  if (millis() - lastDebounceTime > DEBOUNCE_MS) {
+    if (reading != stableState) {
+      stableState = reading;
+      if (stableState == LOW) {
+        pressTime = millis();
+        longHoldFired = false;
+      } else { // release
+        if (!longHoldFired) {
+          clickCount++;
+          lastReleaseTime = millis();
+          waitingForClicks = true;
+        }
+      }
+    }
   }
 
-  if (motionState != IDLE) {
-    updateMotion();
-    return;
+  lastReading = reading;
+
+  // long-hold detection (immediate)
+  if (stableState == LOW && !longHoldFired && (millis() - pressTime) >= LONG_HOLD_TIME) {
+    longHoldFired = true;
+    clickCount = 0;
+    waitingForClicks = false;
+    return 5;
   }
 
-  if      (evt == 1) startBothToggle();
-  else if (evt == 2) startWink();
-  else if (evt == 3) startWave();
-  else if (evt == 4) startSplit();
+  // multi-click timeout
+  if (waitingForClicks && (millis() - lastReleaseTime) >= CLICK_TIMEOUT) {
+    int c = clickCount;
+    clickCount = 0;
+    waitingForClicks = false;
+    if (c <= 0) return 0;
+    if (c == 1) return 1;
+    if (c == 2) return 2;
+    if (c == 3) return 3;
+    return 4; // 4 or more
+  }
+  return 0;
 }
 
 // ===================== MOTIONS =====================
@@ -151,14 +232,16 @@ void startBothToggle() {
   motionState = ACTIVE;
   motionStart = millis();
 
-  if (headlightPos == DOWN) {
-    pwmBegin(leftupPin);
-    pwmBegin(rightupPin);
-    headlightPos = UP;
+  // toggle both individually
+  if (!headUp[0] || !headUp[1]) {
+    // if either is down, move both up
+    if (!headUp[0]) pwmBegin(leftupPin);
+    if (!headUp[1]) pwmBegin(rightupPin);
+    // final states will be updated when motors finish
   } else {
+    // both up -> move both down
     pwmBegin(leftdownPin);
     pwmBegin(rightdownPin);
-    headlightPos = DOWN;
   }
 }
 
@@ -166,7 +249,13 @@ void startWink() {
   motionState = WINKING;
   motionStart = millis();
   winkStep = 1;
-  pwmBegin((headlightPos == UP) ? leftdownPin : leftupPin);
+
+  // store original state ONCE
+  winkOriginalUp = headUp[0];
+
+  // move in opposite direction
+  if (winkOriginalUp) pwmBegin(leftdownPin);
+  else                pwmBegin(leftupPin);
 }
 
 void startSplit() {
@@ -175,123 +264,141 @@ void startSplit() {
   splitFlipped = !splitFlipped;
 
   if (!splitFlipped) {
-    pwmBegin(leftupPin);
-    pwmBegin(rightdownPin);
+    // left up, right down
+    if (!headUp[0]) pwmBegin(leftupPin);
+    if (headUp[1])  pwmBegin(rightdownPin);
   } else {
-    pwmBegin(leftdownPin);
-    pwmBegin(rightupPin);
+    // left down, right up
+    if (headUp[0])  pwmBegin(leftdownPin);
+    if (!headUp[1]) pwmBegin(rightupPin);
   }
 }
 
 void startReset() {
-  pwmOffAll();
+  // move both down (ensure both are down)
   motionState = ACTIVE;
   motionStart = millis();
-  headlightPos = DOWN;
-  splitFlipped = false;
+  if (headUp[0]) pwmBegin(leftdownPin);
+  if (headUp[1]) pwmBegin(rightdownPin);
+  // if they are already down, nothing starts and activeMask==0 will cause no-op
+}
 
-  pwmBegin(leftdownPin);
-  pwmBegin(rightdownPin);
+void queueWaveOrStart() {
+  // If either head is up, bring them down first and queue the wave.
+  if (headUp[0] || headUp[1]) {
+    motionState = QUEUED_WAVE;
+    // Start downs if needed
+    if (headUp[0]) pwmBegin(leftdownPin);
+    if (headUp[1]) pwmBegin(rightdownPin);
+  } else {
+    // Already down: start wave immediately
+    motionState = WAVING;
+    waveStep = 0;
+    waveStepStart = millis();
+    pwmBegin(waveSequence[waveStep++]); // start first wave step
+  }
 }
 
 void startWave() {
-  // Initialize wave by turning both headlights down
-  pwmOffAll();
-  pwmBegin(leftdownPin);
-  pwmBegin(rightdownPin);
-
+  // fallback to startWave if you want immediate start (not used now)
   motionState = WAVING;
   waveStep = 0;
   waveStepStart = millis();
-  pwmOffAll();
-  pwmBegin(waveSequence[0]);
+  pwmBegin(waveSequence[waveStep++]);
 }
 
 // ===================== MOTION UPDATE =====================
 void updateMotion() {
-  pwmUpdate();
   unsigned long now = millis();
 
-  if (motionState == WINKING){
-    if (now - motionStart >= MOTOR_TIME) {
-      pwmOffAll();
-      if (winkStep >= 2) {
-        motionState = IDLE;
-        return;
-      }
-      pwmBegin((headlightPos == UP) ? leftupPin : leftdownPin);
-      motionStart = now;
-      winkStep++;
-    }
+  // update PWM outputs and detect per-channel finishes
+  pwmUpdate();
+
+  // Handle queued wave: wait until all motors finished (activeMask == 0) then start wave
+  if (motionState == QUEUED_WAVE && activeMask == 0) {
+    motionState = WAVING;
+    waveStep = 0;
+    waveStepStart = millis();
+    pwmBegin(waveSequence[waveStep++]); // start first wave step
+    return; 
   }
-  else if (motionState == WAVING) {
-    if (now - waveStepStart >= MOTOR_TIME) {
-      pwmOffAll();
-      waveStep++;
+
+  // WINK: when the first motor finishes (activeMask cleared for that channel),
+  // we start the second (return) movement, then finish.
+  if (motionState == WINKING) {
+    bool leftActive = (activeMask & (MASK(CH_LEFT_UP) | MASK(CH_LEFT_DOWN)));
+
+    if (!leftActive) {
+      if (winkStep == 1) {
+      // return to original position
+        if (winkOriginalUp) pwmBegin(leftupPin);
+        else                pwmBegin(leftdownPin);
+        winkStep = 2;
+      } else {
+        // wink finished
+        motionState = IDLE;
+        winkStep = 0;
+      }
+    }
+    // done
+    return;
+  }
+
+  if (motionState == WAVING) {
+    // start next wave step when WAVE_STEP_DELAY elapsed since last step started
+    if ((now - waveStepStart) >= WAVE_STEP_DELAY) {
+      // If waveStep reached end, finish
       if (waveStep >= WAVE_STEPS) {
+        // ensure remaining motors finish naturally
         motionState = IDLE;
         return;
       }
+      // start next step without killing previous (per-channel stop logic handles each)
+      pwmBegin(waveSequence[waveStep++]);
       waveStepStart = now;
-      pwmBegin(waveSequence[waveStep]);
     }
     return;
   }
 
-  if (now - motionStart >= MAX_MOTOR_TIME) {
+  // ACTIVE state: standard toggles/split/reset — finish when all motors finish
+  if (motionState == ACTIVE) {
+    // safety cutoff
+    if ((now - motionStart) >= MAX_MOTOR_TIME) {
     pwmOffAll();
     motionState = IDLE;
+      return;
+  }
+    // If nothing is actively driven, done
+     if (activeMask == 0) {
+        motionState = IDLE;
+      return;
+     }
   }
 }
 
-// ===================== BUTTON HANDLER =====================
-// Returns:
-// 0 = nothing
-// 1 = single click (toggle both)
-// 2 = double click (wink)
-// 3 = triple click (wave)
-// 4 = quadruple click (split)
-// 5 = long hold (reset)
+// ===================== MAIN LOOP WRAPPER =====================
+void loopWrapper() {
+  // kept for readability if you want to call updateMotion and PWM independently
+  // (we call them in loop())
+}
 
-int checkButton() {
-  bool reading = digitalRead(buttonPin);
+// ===================== MAIN LOOP =====================
+void loop() {
+  int evt = checkButton();
 
-  if (reading != lastReading)
-    lastDebounceTime = millis();
-
-  if (millis() - lastDebounceTime > DEBOUNCE_MS) {
-    if (reading != stableState) {
-      stableState = reading;
-
-      if (stableState == LOW) {
-        pressTime = millis();
-        longHoldFired = false;
-      } else if (!longHoldFired) {
-          clickCount++;
-          lastReleaseTime = millis();
-          waitingForClicks = true;
-      }
+  // long hold event returned immediately by checkButton
+  if (evt == 5) {
+    startReset();
+  } else {
+    // If idle, accept new multi-click events; otherwise ignore (or you could queue)
+    if (motionState == IDLE) {
+      if (evt == 1) startBothToggle();
+      else if (evt == 2) startWink();
+      else if (evt == 3) queueWaveOrStart();
+      else if (evt == 4) startSplit();
     }
   }
 
-  lastReading = reading;
-
-  if (stableState == LOW && !longHoldFired &&
-      millis() - pressTime >= LONG_HOLD_TIME) {
-    longHoldFired = true;
-    clickCount = 0;
-    waitingForClicks = false;
-    return 5;
-  }
-
-  // multi-click timeout: decide which click event it was
-  if (waitingForClicks && millis() - lastReleaseTime >= CLICK_TIMEOUT) {
-    // clamp clicks to 4 for our mapping
-    int c = clickCount;
-    clickCount = 0;
-    waitingForClicks = false;
-    return (c >= 4) ? 4 : c;
-  }
-
-  return 0;
+  // update PWM & motion handling each loop
+  updateMotion();
 }
