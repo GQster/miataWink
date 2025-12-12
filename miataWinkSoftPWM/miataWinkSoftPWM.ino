@@ -5,12 +5,12 @@
 #include <Arduino.h>
 
 // ===================== PINS =====================
-#define buttonPin     33
+#define buttonPin 14 
 
-#define leftupPin     25
-#define leftdownPin   26
-#define rightupPin    27
-#define rightdownPin  14
+#define leftupPin 33 
+#define leftdownPin 25 
+#define rightupPin 26 
+#define rightdownPin 27
 
 // ===================== PWM =====================
 #define PWM_FREQ       1500     // Hz (safe for motors, quiet)
